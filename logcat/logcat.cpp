@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
+#include <sys/time.h>
 
 #define DEFAULT_LOG_ROTATE_SIZE_KBYTES 16
 #define DEFAULT_MAX_ROTATED_LOGS 4
@@ -31,6 +32,7 @@ static int g_tail_lines = 0;
 #define RECORD_LENGTH_FIELD_SIZE_BYTES sizeof(uint32_t)
 
 #define LOG_FILE_DIR    "/dev/log/"
+#define KERNEL_LOG_SOURCE    "/proc/kmsg"
 
 struct queued_entry_t {
     union {
@@ -69,6 +71,7 @@ struct log_device_t {
         queue = NULL;
         next = NULL;
         printed = false;
+        fd = -1;
     }
 
     void enqueue(queued_entry_t* entry) {
@@ -96,6 +99,8 @@ static int g_outFD = -1;
 static off_t g_outByteCount = 0;
 static int g_printBinary = 0;
 static int g_devCount = 0;
+static int g_kernelFD = -1;
+static int g_printKernel = 0;
 
 static EventTagMap* g_eventTagMap = NULL;
 
@@ -247,13 +252,88 @@ static void printNextEntry(log_device_t* dev) {
     skipNextEntry(dev);
 }
 
+//============= copy kernel logs ============================================
+static int printKernelBuffer(char *buf, int count)
+{
+    static android_LogPriority last_prio = ANDROID_LOG_INFO;
+    int bytesWritten = 0;
+    AndroidLogEntry entry;
+    char tag[10]="Kernel";
+    int prio = 0;
+    char *buffer = buf;
+    char *next = NULL;
+    struct timespec ts;
+
+    // kernel log won't be written to STDOUT
+    if (g_outFD == STDOUT_FILENO) {
+        //return 0;
+    }
+
+    while (buffer < (buf + count)) {
+
+        if (buffer[0] != '<') {
+            next = strchr(buffer, '<');
+            if(next == NULL)
+                next = buf + count;
+
+            entry.priority = last_prio;
+        } else {
+
+            if (sscanf(buffer, "<%d>", &prio) < 0)
+                break;
+
+            next = strchr(buffer, '\n');
+            if (next == NULL)
+                next = buf + count;
+            else
+                next++;
+
+            if (prio < 2)
+                entry.priority = ANDROID_LOG_FATAL;
+            else if (prio == 3)
+                entry.priority = ANDROID_LOG_ERROR;
+            else if (prio == 4)
+                entry.priority = ANDROID_LOG_WARN;
+            else if (prio == 5 || prio == 6)
+                entry.priority = ANDROID_LOG_INFO;
+            else if (prio == 7)
+                entry.priority = ANDROID_LOG_DEBUG;
+            else
+                entry.priority = last_prio;
+
+        }
+
+        last_prio = entry.priority;
+
+        clock_gettime(CLOCK_REALTIME, &ts);
+        entry.tv_sec  = ts.tv_sec;
+        entry.tv_nsec = ts.tv_nsec;
+        entry.pid = 0;
+        entry.tid = 0;
+        entry.tag = tag;
+        entry.messageLen =  next - buffer;
+        entry.message = buffer;
+
+        bytesWritten += android_log_printLogLine(g_logformat, g_outFD, &entry);
+        buffer = next;
+    }
+
+    g_outByteCount += bytesWritten;
+
+    if (g_logRotateSizeKBytes > 0
+            && (g_outByteCount / 1024) >= g_logRotateSizeKBytes)
+        rotateLogs();
+
+    return bytesWritten;
+}
+
 static void readLogLines(log_device_t* devices)
 {
     log_device_t* dev;
     int max = 0;
     int ret;
     int queued_lines = 0;
-    bool sleep = false;
+    bool sleep = true;
 
     int result;
     fd_set readset;
@@ -276,7 +356,23 @@ static void readLogLines(log_device_t* devices)
 
         if (result >= 0) {
             for (dev=devices; dev; dev = dev->next) {
-                if (FD_ISSET(dev->fd, &readset)) {
+                if (FD_ISSET(dev->fd, &readset) && (dev->fd == android::g_kernelFD)) {
+                    char knl_buffer[512];
+                    int ret = read(android::g_kernelFD, knl_buffer, sizeof(knl_buffer));
+                    if(ret < 0) {
+                       if ( errno == EINTR )
+                            continue;
+                        else {
+                            perror("read kernel log");
+                            exit(EXIT_FAILURE);
+                        }
+                    }
+
+                    if ( printKernelBuffer(knl_buffer, ret) < 0 ) {
+                        perror("write kernel log");
+                        exit(EXIT_FAILURE);
+                    }
+                } else if (FD_ISSET(dev->fd, &readset)) {
                     queued_entry_t* entry = new queued_entry_t();
                     /* NOTE: driver guarantees we read exactly one full entry */
                     ret = read(dev->fd, entry->buf, LOGGER_ENTRY_MAX_LEN);
@@ -512,9 +608,20 @@ int main(int argc, char **argv)
             break;
 
             case 'b': {
-                char* buf = (char*) malloc(strlen(LOG_FILE_DIR) + strlen(optarg) + 1);
-                strcpy(buf, LOG_FILE_DIR);
-                strcat(buf, optarg);
+                char* buf;
+                if (strcmp(optarg, "kmsg")==0) {
+                    buf = strdup(KERNEL_LOG_SOURCE);
+                    if ( (android::g_kernelFD = open(buf, O_RDONLY)) < 0 ) {
+                        perror("open kernel log failed");
+                        break;
+                    }
+                    android::g_printKernel = 1;
+                }
+                else {
+                    buf = (char*) malloc(strlen(LOG_FILE_DIR) + strlen(optarg) + 1);
+                    strcpy(buf, LOG_FILE_DIR);
+                    strcat(buf, optarg);
+                }
 
                 bool binary = strcmp(optarg, "events") == 0;
                 if (binary) {
@@ -527,8 +634,10 @@ int main(int argc, char **argv)
                         dev = dev->next;
                     }
                     dev->next = new log_device_t(buf, binary, optarg[0]);
+                    dev->next->fd = android::g_kernelFD;
                 } else {
                     devices = new log_device_t(buf, binary, optarg[0]);
+                    devices->fd = android::g_kernelFD;
                 }
                 android::g_devCount++;
             }
@@ -729,7 +838,8 @@ int main(int argc, char **argv)
 
     dev = devices;
     while (dev) {
-        dev->fd = open(dev->device, mode);
+        if (dev->fd < 0)
+            dev->fd = open(dev->device, mode);
         if (dev->fd < 0) {
             fprintf(stderr, "Unable to open log device '%s': %s\n",
                 dev->device, strerror(errno));

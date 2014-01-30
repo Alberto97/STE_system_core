@@ -39,6 +39,8 @@
 #endif
 
 #include <libgen.h>
+#include <sys/prctl.h>
+#include <linux/capability.h>
 
 #include <cutils/list.h>
 #include <cutils/sockets.h>
@@ -98,7 +100,7 @@ static int have_console;
 static char *console_name = "/dev/console";
 static time_t process_needs_restart;
 
-static const char *ENV[32];
+char *ENV[32];
 
 /* add_environment - add "key=value" to the current environment */
 int add_environment(const char *key, const char *val)
@@ -154,6 +156,25 @@ static void publish_socket(const char *name, int fd)
 
     /* make sure we don't close-on-exec */
     fcntl(fd, F_SETFD, 0);
+}
+
+static void set_capabilities(struct service *svc)
+{
+    struct __user_cap_header_struct header;
+    struct __user_cap_data_struct data;
+
+    header.version = _LINUX_CAPABILITY_VERSION;
+    header.pid = getpid();
+    data.effective = data.permitted = data.inheritable = 0;
+
+    if (capget(&header, &data)) {
+        ERROR("capget failed for '%s': %s\n", svc->name, strerror(errno));
+    } else {
+        data.inheritable = svc->capabilities;
+        if (capset(&header, &data)) {
+            ERROR("capset failed for '%s': %s\n", svc->name, strerror(errno));
+        }
+    }
 }
 
 void service_start(struct service *svc, const char *dynamic_args)
@@ -296,7 +317,7 @@ void service_start(struct service *svc, const char *dynamic_args)
 
         setpgid(0, getpid());
 
-    /* as requested, set our gid, supplemental gids, and uid */
+        /* as requested, set our gid, supplemental gids, and uid */
         if (svc->gid) {
             if (setgid(svc->gid) != 0) {
                 ERROR("setgid failed: %s\n", strerror(errno));
@@ -310,9 +331,14 @@ void service_start(struct service *svc, const char *dynamic_args)
             }
         }
         if (svc->uid) {
-            if (setuid(svc->uid) != 0) {
-                ERROR("setuid failed: %s\n", strerror(errno));
-                _exit(127);
+            if (svc->capabilities) {
+                ERROR("warning: service '%s' non-root user ignored as capabilities are specified\n",
+                      svc->name);
+            } else {
+                if (setuid(svc->uid) != 0) {
+                    ERROR("setuid failed: %s\n", strerror(errno));
+                    _exit(127);
+                }
             }
         }
 
@@ -324,6 +350,9 @@ void service_start(struct service *svc, const char *dynamic_args)
             }
         }
 #endif
+        if (svc->capabilities) {
+            set_capabilities(svc);
+        }
 
         if (!dynamic_args) {
             if (execve(svc->args[0], (char**) svc->args, (char**) ENV) < 0) {
@@ -406,6 +435,54 @@ void service_reset(struct service *svc)
 void service_stop(struct service *svc)
 {
     service_stop_or_reset(svc, SVC_DISABLED);
+}
+
+int exec_program(int nargs, char **args)
+{
+    pid_t pid;
+    pid_t deadpid;
+    int status;
+
+    pid = fork();
+
+    if (pid == 0) {
+        if (execve(args[0], &args[0], ENV))
+            ERROR("cannot execve('%s'): %s\n", args[0], strerror(errno));
+        _exit(127);
+    }
+
+    if (pid < 0) {
+        ERROR("failed to start '%s'\n", args[0]);
+        return -errno;
+    }
+
+    do
+    {
+        deadpid = wait(&status);
+        if (deadpid < 0)
+        {
+            ERROR("failed to wait for '%s' (pid %d): %s\n", args[0], pid, strerror(errno));
+            return -errno;
+        }
+    } while (deadpid != pid);
+
+    if (WIFEXITED(status) && WEXITSTATUS(status))
+    {
+        ERROR("%s terminated with status %d.\n", args[0], WEXITSTATUS(status));
+        return -1;
+    }
+    else if (WIFSIGNALED(status))
+    {
+        ERROR("%s was killed by signal %d\n", args[0], WTERMSIG(status));
+        return -1;
+    }
+    else if (WIFSTOPPED(status))
+    {
+        ERROR("%s was stopped by signal %d\n", args[0], WSTOPSIG(status));
+        return -1;
+    }
+
+    return 0;
 }
 
 void property_changed(const char *name, const char *value)
@@ -854,7 +931,7 @@ int main(int argc, char **argv)
     struct pollfd ufds[4];
     char *tmpdev;
     char* debuggable;
-    char tmp[32];
+    char tmp[50];
     int property_set_fd_init = 0;
     int signal_fd_init = 0;
     int keychord_fd_init = 0;

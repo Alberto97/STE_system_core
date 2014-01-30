@@ -50,6 +50,7 @@
 #define SYSFS_PREFIX    "/sys"
 #define FIRMWARE_DIR1   "/etc/firmware"
 #define FIRMWARE_DIR2   "/vendor/firmware"
+#define CRDA_EXEC       "/system/bin/crda"
 
 #ifdef HAVE_SELINUX
 static struct selabel_handle *sehandle;
@@ -62,6 +63,7 @@ struct uevent {
     const char *path;
     const char *subsystem;
     const char *firmware;
+    const char *country;
     const char *partition_name;
     const char *device_name;
     int partition_num;
@@ -332,6 +334,7 @@ static void parse_event(const char *msg, struct uevent *uevent)
     uevent->path = "";
     uevent->subsystem = "";
     uevent->firmware = "";
+    uevent->country = "";
     uevent->major = -1;
     uevent->minor = -1;
     uevent->partition_name = NULL;
@@ -352,6 +355,9 @@ static void parse_event(const char *msg, struct uevent *uevent)
         } else if(!strncmp(msg, "FIRMWARE=", 9)) {
             msg += 9;
             uevent->firmware = msg;
+        } else if(!strncmp(msg, "COUNTRY=", 8)) {
+            msg += 8;
+            uevent->country = msg;
         } else if(!strncmp(msg, "MAJOR=", 6)) {
             msg += 6;
             uevent->major = atoi(msg);
@@ -374,9 +380,10 @@ static void parse_event(const char *msg, struct uevent *uevent)
             ;
     }
 
-    log_event_print("event { '%s', '%s', '%s', '%s', %d, %d }\n",
+    log_event_print("event { '%s', '%s', '%s', '%s', '%s', %d, %d }\n",
                     uevent->action, uevent->path, uevent->subsystem,
-                    uevent->firmware, uevent->major, uevent->minor);
+                    uevent->country, uevent->firmware, uevent->major,
+                    uevent->minor);
 }
 
 static char **get_character_device_symlinks(struct uevent *uevent)
@@ -658,6 +665,28 @@ static void handle_generic_device_event(struct uevent *uevent)
              uevent->major, uevent->minor, links);
 }
 
+static void handle_regulatory_event(struct uevent *uevent)
+{
+    if (!strcmp(uevent->subsystem, "platform") &&
+        !strcmp(uevent->action, "change") &&
+         strcmp(uevent->country, "")) {
+
+        pid_t pid;
+        char *const param_list[] = { CRDA_EXEC, NULL };
+        char env_args[11] = "COUNTRY=";
+        char *const env_params[2] = { strncat(env_args, uevent->country, 2), NULL };
+
+        pid = fork();
+        if (pid == 0) {
+            execve(CRDA_EXEC, param_list, env_params);
+            _exit(127);
+        }
+        else {
+            waitpid(pid, NULL, 0);
+        }
+    }
+}
+
 static void handle_device_event(struct uevent *uevent)
 {
     if (!strcmp(uevent->action,"add"))
@@ -811,6 +840,10 @@ static void handle_firmware_event(struct uevent *uevent)
     if(strcmp(uevent->action, "add"))
         return;
 
+    /* return for modem and ipl firmware requests */
+    if (strstr(uevent->path, "dbx500_mloader_fw") != NULL)
+         return;
+
     /* we fork, to avoid making large memory allocations in init proper */
     pid = fork();
     if (!pid) {
@@ -836,6 +869,7 @@ void handle_device_fd()
 
         handle_device_event(&uevent);
         handle_firmware_event(&uevent);
+        handle_regulatory_event(&uevent);
     }
 }
 

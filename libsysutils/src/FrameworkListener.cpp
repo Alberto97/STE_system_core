@@ -43,7 +43,7 @@ void FrameworkListener::init(const char *socketName, bool withSeq) {
 }
 
 bool FrameworkListener::onDataAvailable(SocketClient *c) {
-    char buffer[255];
+    char buffer[1024];
     int len;
 
     len = TEMP_FAILURE_RETRY(read(c->getSocket(), buffer, sizeof(buffer)));
@@ -74,7 +74,7 @@ void FrameworkListener::dispatchCommand(SocketClient *cli, char *data) {
     FrameworkCommandCollection::iterator i;
     int argc = 0;
     char *argv[FrameworkListener::CMD_ARGS_MAX];
-    char tmp[255];
+    char tmp[1024];
     char *p = data;
     char *q = tmp;
     char *qlimit = tmp + sizeof(tmp) - 1;

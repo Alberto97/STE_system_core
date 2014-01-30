@@ -98,6 +98,7 @@ struct service {
 #ifdef HAVE_SELINUX
     char *seclabel;
 #endif
+    uint32_t capabilities;
 
     struct socketinfo *sockets;
     struct svcenvinfo *envvars;
@@ -130,6 +131,7 @@ void service_for_each_flags(unsigned matchflags,
 void service_stop(struct service *svc);
 void service_reset(struct service *svc);
 void service_start(struct service *svc, const char *dynamic_args);
+int exec_program(int nargs, char **args);
 void property_changed(const char *name, const char *value);
 
 #define INIT_IMAGE_FILE	"/initlogo.rle"

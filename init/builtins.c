@@ -241,7 +241,11 @@ int do_domainname(int nargs, char **args)
 
 int do_exec(int nargs, char **args)
 {
-    return -1;
+    int ret;
+
+    ret = exec_program(nargs - 1, &args[1]);
+
+    return ret;
 }
 
 int do_export(int nargs, char **args)
@@ -642,27 +646,50 @@ int do_copy(int nargs, char **args)
     char *buffer = NULL;
     int rc = 0;
     int fd1 = -1, fd2 = -1;
-    struct stat info;
+    struct stat infosrc, infodst;
     int brtw, brtr;
     char *p;
+    int update = 0;
 
-    if (nargs != 3)
+    if (nargs < 3 || nargs > 4)
         return -1;
 
-    if (stat(args[1], &info) < 0) 
+    if (nargs == 4)
+    {
+        if (!strcmp(args[1], "-u"))
+            update = 1;
+        else
+            return -1;
+
+        args++;
+        nargs--;
+    }
+
+    if (stat(args[1], &infosrc) < 0)
         return -1;
 
-    if ((fd1 = open(args[1], O_RDONLY)) < 0) 
+    if (update)
+    {
+        if (stat(args[2], &infodst) < 0)
+        {
+            if (errno != ENOENT)
+                return -1;
+        }
+        else if (infodst.st_mtime >= infosrc.st_mtime)
+            return 0;
+    }
+
+    if ((fd1 = open(args[1], O_RDONLY)) < 0)
         goto out_err;
 
     if ((fd2 = open(args[2], O_WRONLY|O_CREAT|O_TRUNC, 0660)) < 0)
         goto out_err;
 
-    if (!(buffer = malloc(info.st_size)))
+    if (!(buffer = malloc(infosrc.st_size)))
         goto out_err;
 
     p = buffer;
-    brtr = info.st_size;
+    brtr = infosrc.st_size;
     while(brtr) {
         rc = read(fd1, p, brtr);
         if (rc < 0)
@@ -674,7 +701,7 @@ int do_copy(int nargs, char **args)
     }
 
     p = buffer;
-    brtw = info.st_size;
+    brtw = infosrc.st_size;
     while(brtw) {
         rc = write(fd2, p, brtw);
         if (rc < 0)

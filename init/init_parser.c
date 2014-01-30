@@ -583,6 +583,15 @@ void queue_builtin_action(int (*func)(int nargs, char **args), char *name)
 
 void action_add_queue_tail(struct action *act)
 {
+    struct listnode *node;
+    struct action *act_in_queue;
+    list_for_each(node, &action_queue) {
+        act_in_queue = node_to_item(node, struct action, qlist);
+        if(act_in_queue == act) {
+            ERROR("%s already in action queue",act->name);
+            return;
+        }
+    }
     list_add_tail(&action_queue, &act->qlist);
 }
 
@@ -653,6 +662,18 @@ static void parse_line_service(struct parse_state *state, int nargs, char **args
     kw = lookup_keyword(args[0]);
     switch (kw) {
     case K_capability:
+        if (nargs < 2) {
+            parse_error(state, "capability option requires at least one capability name\n");
+        } else {
+            for (i = 1; i < nargs; i++) {
+                uint32_t capability = decode_capability(args[i]);
+                if (capability == 0) {
+                    parse_error(state, "discarding unsupported capability: %s\n", args[i]);
+                } else {
+                    svc->capabilities |= capability;
+                }
+            }
+        }
         break;
     case K_class:
         if (nargs != 2) {
